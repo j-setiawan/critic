@@ -823,8 +823,14 @@ async fn pull_request_file_paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewComment, build_review_threads, parse_review_threads_page};
+    use super::{
+        ReviewComment, build_review_threads, list_review_comment_threads, parse_review_threads_page,
+    };
     use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     fn review_comment(id: u64, in_reply_to_id: Option<u64>) -> ReviewComment {
         let mut payload = json!({
@@ -961,5 +967,51 @@ mod tests {
         let large = json!({"data": {"repository": null, "padding": "x".repeat(5000)}});
         let error = parse_review_threads_page(large).expect_err("null repository is an error");
         assert!(error.to_string().len() < 1000, "error should stay bounded");
+    }
+
+    /// End-to-end regression test for the original bug: when the GraphQL
+    /// resolution query returns a null `data` payload (HTTP 200, no `errors`
+    /// array), the pull request must still open. Threads load from REST, the
+    /// call succeeds, and a header warning is returned instead of an error.
+    #[tokio::test]
+    async fn opens_pull_request_when_resolution_data_is_null() {
+        let server = MockServer::start().await;
+
+        // REST review comments: one healthy top-level comment.
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/repo/pulls/7/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                serde_json::to_value(review_comment(1, None)).unwrap()
+            ])))
+            .mount(&server)
+            .await;
+
+        // GraphQL resolution query: the failure shape from the bug report.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": null})))
+            .mount(&server)
+            .await;
+
+        let client = octocrab::OctocrabBuilder::new()
+            .base_uri(server.uri())
+            .expect("mock server uri is valid")
+            .build()
+            .expect("octocrab client builds");
+
+        let (threads, warning) = list_review_comment_threads(&client, "octo", "repo", 7)
+            .await
+            .expect("PR load must survive a null resolution response");
+
+        assert_eq!(threads.len(), 1, "REST thread still loads");
+        assert!(
+            !threads[0].is_resolved,
+            "degraded mode must not hide threads as resolved"
+        );
+        let warning = warning.expect("degraded load surfaces a warning");
+        assert!(
+            warning.contains("resolved state unavailable"),
+            "got: {warning}"
+        );
     }
 }
