@@ -281,6 +281,7 @@ async fn process_worker_message(
                 Ok(data) => {
                     state.error_message = None;
                     markdown.clear_diff_cache();
+                    let load_warning = data.load_warning.clone();
 
                     if let Some(review) = state.review.as_mut()
                         && review.pull.number == pull.number
@@ -289,6 +290,9 @@ async fn process_worker_message(
                     {
                         review.clear_diff();
                         let head_changed = review.set_data(data);
+                        if let Some(warning) = load_warning {
+                            state.error_message = Some(warning);
+                        }
                         if head_changed && review.pending_review_comment_count() > 0 {
                             state.error_message = Some(format!(
                                 "pull request changed upstream; {} pending inline comment(s) may now be outdated",
@@ -301,6 +305,9 @@ async fn process_worker_message(
                     }
 
                     state.open_review(pull, data);
+                    if let Some(warning) = load_warning {
+                        state.error_message = Some(warning);
+                    }
                     if let (Some(store), Some(review)) = (draft_store, state.review.as_mut()) {
                         match store.load_for_review(review).await {
                             Ok(LoadOutcome::Loaded {

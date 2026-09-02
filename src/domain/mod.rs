@@ -81,6 +81,9 @@ pub struct PullRequestData {
     pub base_sha: String,
     pub changed_files: Vec<String>,
     pub comments: Vec<PullRequestComment>,
+    /// Non-fatal warning raised while loading (e.g. review thread resolved
+    /// state unavailable). Shown in the header without blocking the review.
+    pub load_warning: Option<String>,
 }
 
 impl PullRequestData {
