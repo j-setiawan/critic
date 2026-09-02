@@ -173,6 +173,101 @@ query PullRequestReviewThreadComments($threadId: ID!, $after: String) {
 }
 "#;
 
+/// Appends resolution fallback details to a debug log in the temp directory,
+/// since the TUI owns the terminal and stderr is not visible while it runs.
+fn log_resolution_fallback(
+    owner: &str,
+    repo: &str,
+    pull_number: u64,
+    error: &PullRequestCommentsError,
+) -> String {
+    use std::io::Write;
+
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join("critic-debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            file,
+            "[{unix_secs}] {owner}/{repo}#{pull_number}: review thread resolution unavailable, \
+             opening without resolved state: {error}"
+        );
+    }
+
+    path.display().to_string()
+}
+
+/// Parses one page of the review thread resolution query, reporting GraphQL
+/// errors and pinpointing which level of the response was null or malformed.
+fn parse_review_threads_page(raw: serde_json::Value) -> Result<GraphQlReviewThreads> {
+    let response: GraphQlResponse = serde_json::from_value(raw.clone()).map_err(|error| {
+        PullRequestCommentsError::GraphQlResponseError(format!(
+            "unexpected review thread response shape ({error}); {}",
+            truncated_response_body(&raw)
+        ))
+    })?;
+
+    if let Some(errors) = response.errors
+        && !errors.is_empty()
+    {
+        let message = errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(PullRequestCommentsError::GraphQlResponseError(message));
+    }
+
+    response
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repository| repository.pull_request)
+        .map(|pull_request| pull_request.review_threads)
+        .ok_or_else(|| {
+            PullRequestCommentsError::GraphQlResponseError(format!(
+                "missing review thread data in GraphQL response: {}; {}",
+                missing_review_thread_level(&raw),
+                truncated_response_body(&raw)
+            ))
+        })
+}
+
+/// Names the first null/absent level in the `data.repository.pullRequest` chain.
+fn missing_review_thread_level(raw: &serde_json::Value) -> &'static str {
+    let data = raw.get("data").filter(|value| !value.is_null());
+    let Some(data) = data else {
+        return "`data` is null or absent (possible rate limit or transient API failure)";
+    };
+
+    let repository = data.get("repository").filter(|value| !value.is_null());
+    if repository.is_none() {
+        return "`data.repository` is null (the token may not be able to see this repository)";
+    }
+
+    "`data.repository.pullRequest` is null (the token may not be able to see this pull request)"
+}
+
+/// Returns a bounded snippet of the raw response body for error reports.
+fn truncated_response_body(raw: &serde_json::Value) -> String {
+    const MAX_LEN: usize = 600;
+    let mut body = raw.to_string();
+    if body.len() > MAX_LEN {
+        let mut end = MAX_LEN;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push('…');
+    }
+    format!("raw response (truncated): {body}")
+}
+
 #[derive(Debug)]
 struct BuildNode {
     comment: ReviewComment,
@@ -184,7 +279,13 @@ pub async fn fetch_pull_request_data(
     client: &octocrab::Octocrab,
     pull: &PullRequestSummary,
 ) -> Result<PullRequestData> {
-    let (changed_files_set, review_threads, issue_comments, review_summaries, pull_state) = tokio::try_join!(
+    let (
+        changed_files_set,
+        (review_threads, load_warning),
+        issue_comments,
+        review_summaries,
+        pull_state,
+    ) = tokio::try_join!(
         pull_request_file_paths(client, &pull.owner, &pull.repo, pull.number),
         list_review_comment_threads(client, &pull.owner, &pull.repo, pull.number),
         list_issue_comments(client, &pull.owner, &pull.repo, pull.number),
@@ -235,6 +336,7 @@ pub async fn fetch_pull_request_data(
         base_sha: pull_state.base.sha,
         changed_files,
         comments: merged.into_iter().map(|(_, entry)| entry).collect(),
+        load_warning,
     })
 }
 
@@ -402,7 +504,7 @@ async fn list_review_comment_threads(
     owner: &str,
     repo: &str,
     pull_number: u64,
-) -> Result<Vec<ReviewThread>> {
+) -> Result<(Vec<ReviewThread>, Option<String>)> {
     let first_page = client
         .pulls(owner, repo)
         .list_comments(Some(pull_number))
@@ -411,18 +513,37 @@ async fn list_review_comment_threads(
         .await?;
     let mapped = client.all_pages(first_page).await?;
 
-    let resolved_by_comment_id =
-        review_thread_resolution_map(client, owner, repo, pull_number).await?;
+    // Resolution state is a decoration on top of the REST comment data. If the
+    // GraphQL resolution query fails, still open the pull request: fall back to
+    // an empty map so every thread renders (as unresolved) instead of failing
+    // the whole load. A concise warning is surfaced in the header; full details
+    // are appended to a debug log for bug reports.
+    let (resolved_by_comment_id, resolution_warning) =
+        match review_thread_resolution_map(client, owner, repo, pull_number).await {
+            Ok(map) => (map, None),
+            Err(error) => {
+                let log_path = log_resolution_fallback(owner, repo, pull_number, &error);
+                let warning = format!(
+                    "review thread resolved state unavailable; showing all threads as \
+                     unresolved (details: {log_path})"
+                );
+                (HashMap::new(), Some(warning))
+            }
+        };
+    let resolution_available = resolution_warning.is_none();
 
     let mut threads = build_review_threads(mapped);
     for thread in &mut threads {
         apply_thread_resolution(thread, &resolved_by_comment_id);
-        if thread.thread_id.is_none() && thread.replies.is_empty() {
+        // Only apply the "reply-less thread counts as resolved" heuristic when
+        // resolution data actually loaded; otherwise it would hide every
+        // single-comment thread behind the resolved filter.
+        if resolution_available && thread.thread_id.is_none() && thread.replies.is_empty() {
             set_thread_resolved_without_id(thread);
         }
     }
 
-    Ok(threads)
+    Ok((threads, resolution_warning))
 }
 
 async fn list_issue_comments(
@@ -571,7 +692,7 @@ async fn review_thread_resolution_map(
     let mut resolved_by_comment_id = HashMap::new();
 
     loop {
-        let response: GraphQlResponse = client
+        let raw: serde_json::Value = client
             .graphql(&serde_json::json!({
                 "query": REVIEW_THREADS_RESOLUTION_QUERY,
                 "variables": {
@@ -583,27 +704,7 @@ async fn review_thread_resolution_map(
             }))
             .await?;
 
-        if let Some(errors) = response.errors
-            && !errors.is_empty()
-        {
-            let message = errors
-                .into_iter()
-                .map(|error| error.message)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(PullRequestCommentsError::GraphQlResponseError(message));
-        }
-
-        let Some(review_threads) = response
-            .data
-            .and_then(|data| data.repository)
-            .and_then(|repository| repository.pull_request)
-            .map(|pull_request| pull_request.review_threads)
-        else {
-            return Err(PullRequestCommentsError::GraphQlResponseError(
-                "missing review thread data in GraphQL response".to_owned(),
-            ));
-        };
+        let review_threads = parse_review_threads_page(raw)?;
 
         for thread in &review_threads.nodes {
             let mut comment_ids = thread
@@ -722,7 +823,7 @@ async fn pull_request_file_paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewComment, build_review_threads};
+    use super::{ReviewComment, build_review_threads, parse_review_threads_page};
     use serde_json::json;
 
     fn review_comment(id: u64, in_reply_to_id: Option<u64>) -> ReviewComment {
@@ -767,5 +868,98 @@ mod tests {
 
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].comment.id.into_inner(), 5);
+    }
+
+    #[test]
+    fn parses_healthy_review_threads_page() {
+        let raw = json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": false, "endCursor": null},
+                            "nodes": [{
+                                "id": "PRRT_abc",
+                                "isResolved": true,
+                                "comments": {
+                                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                                    "nodes": [{"databaseId": 42}, {"databaseId": null}]
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let page = parse_review_threads_page(raw).expect("healthy page parses");
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.nodes[0].id, "PRRT_abc");
+        assert!(page.nodes[0].is_resolved);
+        assert_eq!(page.nodes[0].comments.nodes[0].database_id, Some(42));
+        assert_eq!(page.nodes[0].comments.nodes[1].database_id, None);
+    }
+
+    #[test]
+    fn reports_graphql_errors_before_missing_data() {
+        let raw = json!({
+            "data": null,
+            "errors": [{"message": "API rate limit exceeded"}]
+        });
+
+        let error = parse_review_threads_page(raw).expect_err("errors are surfaced");
+        assert!(error.to_string().contains("API rate limit exceeded"));
+    }
+
+    #[test]
+    fn pinpoints_null_data() {
+        let raw = json!({"data": null});
+        let error = parse_review_threads_page(raw).expect_err("null data is an error");
+        let message = error.to_string();
+        assert!(message.contains("`data` is null"), "got: {message}");
+        assert!(message.contains("raw response"), "got: {message}");
+    }
+
+    #[test]
+    fn pinpoints_null_repository() {
+        let raw = json!({"data": {"repository": null}});
+        let error = parse_review_threads_page(raw).expect_err("null repository is an error");
+        assert!(
+            error.to_string().contains("`data.repository` is null"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn pinpoints_null_pull_request() {
+        let raw = json!({"data": {"repository": {"pullRequest": null}}});
+        let error = parse_review_threads_page(raw).expect_err("null pullRequest is an error");
+        assert!(
+            error
+                .to_string()
+                .contains("`data.repository.pullRequest` is null"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn reports_shape_mismatch_with_body() {
+        // reviewThreads present but with the wrong shape: typed parse fails.
+        let raw = json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": "oops"}}}}
+        });
+        let error = parse_review_threads_page(raw).expect_err("shape mismatch is an error");
+        let message = error.to_string();
+        assert!(
+            message.contains("unexpected review thread response shape"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn truncates_large_response_bodies() {
+        let large = json!({"data": {"repository": null, "padding": "x".repeat(5000)}});
+        let error = parse_review_threads_page(large).expect_err("null repository is an error");
+        assert!(error.to_string().len() < 1000, "error should stay bounded");
     }
 }

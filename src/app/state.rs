@@ -2063,6 +2063,7 @@ mod tests {
             base_sha: "basesha".to_owned(),
             changed_files: Vec::new(),
             comments,
+            load_warning: None,
         };
 
         ReviewScreenState::new(pull, data)
